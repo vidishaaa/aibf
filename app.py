@@ -1,0 +1,334 @@
+"""
+app.py
+------
+Streamlit app for AI Stock Recommendation.
+
+Features:
+- Ticker + date inputs; optional news sentiment toggle (display-only if column exists)
+- BUY/HOLD/SELL recommendation card with confidence and explainability
+- Interactive Plotly charts: price with MAs & Bollinger bands, volume, RSI, MACD
+- Optional sentiment timeline if 'sentiment_avg_compound' present
+- Download computed dataset CSV and generate an executive brief (template-based)
+
+Run:
+  pip install -r requirements.txt
+  streamlit run app.py
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from typing import Tuple
+
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+
+from stock_logic import (
+    fetch_price_data,
+    compute_indicators,
+    get_recommendation,
+    build_feature_label_dataset,
+    generate_brief,
+    load_sample_tickers,
+)
+
+
+# -----------------------------
+# Streamlit Config
+# -----------------------------
+
+st.set_page_config(
+    page_title="AI Stock Recommendation",
+    page_icon="📈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# -----------------------------
+# Caching Helpers
+# -----------------------------
+
+@st.cache_data(show_spinner=False)
+def cached_fetch(ticker: str, start: str, end: str) -> pd.DataFrame:
+    return fetch_price_data(ticker, start, end)
+
+
+@st.cache_data(show_spinner=False)
+def cached_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    return compute_indicators(df)
+
+
+# -----------------------------
+# UI Helpers
+# -----------------------------
+
+def _recommendation_badge(label: str, confidence: int) -> str:
+    if label == "BUY":
+        return f"🟢 BUY ({confidence})"
+    if label == "SELL":
+        return f"🔴 SELL ({confidence})"
+    return f"🟡 HOLD ({confidence})"
+
+
+def _styled_container(label: str):
+    color = "#2ecc71" if label == "BUY" else ("#e74c3c" if label == "SELL" else "#f1c40f")
+    return st.container(border=True)
+
+def _fmt(value, fmt: str, fallback: str = "—") -> str:
+    try:
+        # If it's a Series or array, take the last element
+        if isinstance(value, (pd.Series, np.ndarray, list, tuple)):
+            if len(value) == 0:
+                return fallback
+            value = value[-1]
+        val = float(value)
+        if np.isnan(val):
+            return fallback
+        return format(val, fmt)
+    except Exception:
+        return fallback
+
+
+def _to_float(value) -> float:
+    """Coerce potential Series/array/scalar to a float, or np.nan on failure."""
+    try:
+        if isinstance(value, pd.Series):
+            if value.empty:
+                return np.nan
+            value = value.iloc[-1]
+        elif isinstance(value, (np.ndarray, list, tuple)):
+            if len(value) == 0:
+                return np.nan
+            value = value[-1]
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def plot_price_volume(df: pd.DataFrame) -> go.Figure:
+    # Two-row subplot: price on top, volume below (shared x)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.75, 0.25])
+
+    # Price traces
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", line=dict(color="#1f77b4", width=2)), row=1, col=1)
+    if "sma_50" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["sma_50"], name="MA50", line=dict(color="#2ca02c", width=1)), row=1, col=1)
+    if "sma_200" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["sma_200"], name="MA200", line=dict(color="#d62728", width=1)), row=1, col=1)
+
+    # Bollinger band shading on price axis
+    if set(["bb_upper_20", "bb_lower_20"]).issubset(df.columns):
+        fig.add_trace(go.Scatter(x=df.index, y=df["bb_upper_20"], line=dict(width=0), showlegend=False, hoverinfo="skip"), row=1, col=1)
+        fig.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=df["bb_lower_20"],
+                fill="tonexty",
+                fillcolor="rgba(31,119,180,0.1)",
+                line=dict(width=0),
+                name="Bollinger 20",
+            ),
+            row=1,
+            col=1,
+        )
+
+    # Volume bars on second row
+    if "Volume" in df.columns:
+        fig.add_trace(
+            go.Bar(x=df.index, y=df["Volume"], name="Volume", marker_color="rgba(128,128,128,0.5)"),
+            row=2,
+            col=1,
+        )
+
+    fig.update_layout(
+        height=600,
+        margin=dict(l=30, r=30, t=30, b=30),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        yaxis=dict(title="Price"),
+        yaxis2=dict(title="Volume", showgrid=False),
+    )
+    return fig
+
+
+def plot_rsi_macd(df: pd.DataFrame) -> go.Figure:
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08, subplot_titles=("RSI (14)", "MACD"))
+
+    # RSI with 30/70 lines
+    if "rsi_14" in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df["rsi_14"], name="RSI14", line=dict(color="#8e44ad")), row=1, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="gray", row=1, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="gray", row=1, col=1)
+
+    # MACD histogram and signal
+    if set(["macd", "macd_signal", "macd_hist"]).issubset(df.columns):
+        fig.add_trace(
+            go.Bar(x=df.index, y=df["macd_hist"], name="MACD Hist", marker_color="rgba(52,152,219,0.5)"),
+            row=2,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=df.index, y=df["macd"], name="MACD", line=dict(color="#2980b9")), row=2, col=1
+        )
+        fig.add_trace(
+            go.Scatter(x=df.index, y=df["macd_signal"], name="Signal", line=dict(color="#c0392b", dash="dot")),
+            row=2,
+            col=1,
+        )
+
+    fig.update_layout(height=500, margin=dict(l=30, r=30, t=30, b=30))
+    return fig
+
+
+def plot_sentiment(df: pd.DataFrame) -> go.Figure:
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df.index,
+            y=df["sentiment_avg_compound"],
+            name="Sentiment",
+            line=dict(color="#16a085"),
+        )
+    )
+    fig.update_layout(height=300, margin=dict(l=30, r=30, t=30, b=30), yaxis=dict(title="VADER Compound"))
+    return fig
+
+
+# -----------------------------
+# Main App
+# -----------------------------
+
+from plotly.subplots import make_subplots
+
+
+def main():
+    st.title("AI Stock Recommendation")
+    st.caption("Rule-based + scoring model over technical indicators. No external LLMs or paid APIs.")
+
+    # Sidebar inputs
+    st.sidebar.header("Inputs")
+    default_end = dt.date.today()
+    default_start = default_end - dt.timedelta(days=365)
+    ticker = st.sidebar.text_input("Ticker", value="AAPL")
+    start_date = st.sidebar.date_input("Start date", value=default_start)
+    end_date = st.sidebar.date_input("End date", value=default_end)
+    include_sentiment = st.sidebar.checkbox("Include news sentiment (optional)", value=True)
+    st.sidebar.write("Sample tickers:", ", ".join(load_sample_tickers()))
+    run_btn = st.sidebar.button("Get Recommendation", use_container_width=True)
+
+    # Early validation
+    if run_btn:
+        if not ticker.strip():
+            st.error("Please enter a ticker symbol.")
+            st.stop()
+        if start_date >= end_date:
+            st.error("Start date must be before end date.")
+            st.stop()
+
+    # Trigger computation
+    if run_btn:
+        with st.spinner("Fetching data and computing indicators..."):
+            df_raw = cached_fetch(ticker.strip().upper(), str(start_date), str(end_date))
+            if df_raw is None or df_raw.empty:
+                st.error("No data found for the given inputs. Try another ticker or date range.")
+                st.stop()
+            df = cached_indicators(df_raw)
+            # Warn if long windows not available
+            if df["sma_200"].isna().sum() > 0:
+                st.info("Some early dates have NaN for MA200. Consider selecting a wider date range to warm-up indicators.")
+
+        latest_row = df.iloc[-1]
+        label, confidence, rules = get_recommendation(latest_row)
+
+        # Top card
+        st.subheader("Recommendation")
+        col1, col2 = st.columns([2, 1])
+        with col1:
+            st.markdown(f"### {_recommendation_badge(label, confidence)}")
+        with col2:
+            close_val = _to_float(latest_row.get('Close', np.nan))
+            ret1d_val = _to_float(latest_row.get('daily_return', np.nan))
+            close_display = f"{close_val:.2f}" if not np.isnan(close_val) else "—"
+            ret_display = f"{ret1d_val*100:.2f}%" if not np.isnan(ret1d_val) else "—"
+            st.metric("Close", close_display, delta=ret_display)
+
+        # Two-column layout
+        left, right = st.columns([3, 1])
+        with left:
+            try:
+                price_fig = plot_price_volume(df)
+                st.plotly_chart(price_fig, use_container_width=True, theme="streamlit")
+            except Exception as e:
+                st.warning(f"Unable to render price/volume chart: {e}")
+
+        with right:
+            st.markdown("#### Indicators (latest)")
+            mini_cols = st.columns(2)
+            mini_cols[0].metric("RSI14", _fmt(latest_row.get('rsi_14', np.nan), ".2f"))
+            mini_cols[1].metric("MACD", _fmt(latest_row.get('macd', np.nan), ".4f"))
+            mini_cols[0].metric("ATR14", _fmt(latest_row.get('atr_14', np.nan), ".2f"))
+            mini_cols[1].metric("Volatility 21d", _fmt(latest_row.get('vol_21', np.nan), ".4f"))
+            # Return display as percentage
+            ret_display = "—"
+            value = latest_row.get('daily_return', np.nan)
+        if pd.notna(value):
+            ret_val = float(value) * 100.0
+            ret_display = f"{ret_val:.2f}%"
+        else:
+            ret_display = "—"
+
+
+            mini_cols[0].metric("Return 1d", ret_display)
+            mini_cols[1].metric("Avg Volume 21d", _fmt(latest_row.get('vol_mean_21', np.nan), ".0f"))
+
+            st.markdown("#### Explainability")
+            for name, info in rules.items():
+                icon = "✅" if info.get("fired") else "➖"
+                contrib = info.get("contribution", 0)
+                st.write(f"{icon} {name} (contrib {contrib:+d}) — {info.get('explanation')}")
+
+        st.markdown("### Momentum & Oscillators")
+        try:
+            st.plotly_chart(plot_rsi_macd(df), use_container_width=True, theme="streamlit")
+        except Exception as e:
+            st.warning(f"Unable to render RSI/MACD chart: {e}")
+
+        # Optional sentiment timeline if column exists and user opted in
+        if include_sentiment and "sentiment_avg_compound" in df.columns and not df["sentiment_avg_compound"].isna().all():
+            st.markdown("### News Sentiment (if available)")
+            st.plotly_chart(plot_sentiment(df), use_container_width=True, theme="streamlit")
+        elif include_sentiment:
+            st.info("Sentiment column not found in data. Provide it from your backend to enable this panel.")
+
+        # Dataset download & brief
+        st.markdown("---")
+        try:
+            dataset = build_feature_label_dataset(df)
+            csv_bytes = dataset.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="Download Dataset (CSV)",
+                data=csv_bytes,
+                file_name=f"{ticker.upper()}_features_labels.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.warning(f"Unable to build downloadable dataset: {e}")
+
+        if st.button("Generate Brief", use_container_width=True):
+            try:
+                brief = generate_brief(df, label, confidence)
+                st.success(brief)
+            except Exception as e:
+                st.warning(f"Unable to generate brief: {e}")
+
+
+if __name__ == "__main__":
+    # Example usage instructions for local run
+    print("Install deps: pip install -r requirements.txt")
+    print("Run app: streamlit run app.py")
+    main()
+
+
