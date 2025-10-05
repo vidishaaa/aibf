@@ -24,6 +24,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+import os
 
 from stock_logic import (
     fetch_price_data,
@@ -33,6 +34,13 @@ from stock_logic import (
     generate_brief,
     load_sample_tickers,
 )
+
+# News sentiment imports
+try:
+    from news_ingestion import fetch_newsapi_headlines, aggregate_daily_sentiment_vader
+except ImportError:
+    fetch_newsapi_headlines = None
+    aggregate_daily_sentiment_vader = None
 
 
 # -----------------------------
@@ -59,6 +67,33 @@ def cached_fetch(ticker: str, start: str, end: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False)
 def cached_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return compute_indicators(df)
+
+
+@st.cache_data(show_spinner=False)
+def cached_fetch_sentiment(ticker: str, start: str, end: str, api_key: str) -> pd.DataFrame:
+    """Fetch and aggregate news sentiment for a ticker and date range."""
+    if not api_key or not fetch_newsapi_headlines or not aggregate_daily_sentiment_vader:
+        return pd.DataFrame(columns=["date", "sentiment_avg_compound", "headline_count"])
+    
+    try:
+        # Fetch news headlines
+        df_news = fetch_newsapi_headlines(
+            query=ticker, 
+            start_date=start, 
+            end_date=end, 
+            api_key=api_key
+        )
+        
+        if df_news is None or df_news.empty:
+            return pd.DataFrame(columns=["date", "sentiment_avg_compound", "headline_count"])
+        
+        # Aggregate daily sentiment
+        daily_sentiment = aggregate_daily_sentiment_vader(df_news)
+        return daily_sentiment
+        
+    except Exception as e:
+        st.warning(f"News sentiment fetch failed: {e}")
+        return pd.DataFrame(columns=["date", "sentiment_avg_compound", "headline_count"])
 
 
 # -----------------------------
@@ -204,6 +239,12 @@ from plotly.subplots import make_subplots
 
 
 def main():
+    # Load .env for local dev if present
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv()
+    except Exception:
+        pass
     st.title("AI Stock Recommendation")
     st.caption("Rule-based + scoring model over technical indicators. No external LLMs or paid APIs.")
 
@@ -215,6 +256,8 @@ def main():
     start_date = st.sidebar.date_input("Start date", value=default_start)
     end_date = st.sidebar.date_input("End date", value=default_end)
     include_sentiment = st.sidebar.checkbox("Include news sentiment (optional)", value=True)
+    if include_sentiment and not os.environ.get("NEWSAPI_KEY"):
+        st.sidebar.info("Set NEWSAPI_KEY in a .env file to enable news sentiment in dataset builds.")
     st.sidebar.write("Sample tickers:", ", ".join(load_sample_tickers()))
     run_btn = st.sidebar.button("Get Recommendation", use_container_width=True)
 
@@ -230,11 +273,57 @@ def main():
     # Trigger computation
     if run_btn:
         with st.spinner("Fetching data and computing indicators..."):
+            # Fetch price data
             df_raw = cached_fetch(ticker.strip().upper(), str(start_date), str(end_date))
             if df_raw is None or df_raw.empty:
                 st.error("No data found for the given inputs. Try another ticker or date range.")
                 st.stop()
+            
+            # Compute technical indicators
             df = cached_indicators(df_raw)
+            
+            # Fetch news sentiment if enabled and API key available
+            if include_sentiment:
+                news_api_key = os.environ.get("NEWSAPI_KEY")
+                if news_api_key:
+                    with st.spinner("Fetching news sentiment..."):
+                        sentiment_df = cached_fetch_sentiment(
+                            ticker.strip().upper(), 
+                            str(start_date), 
+                            str(end_date), 
+                            news_api_key
+                        )
+                        
+                        # Merge sentiment data with price data
+                        if not sentiment_df.empty:
+                            # Convert sentiment date to datetime for merging
+                            sentiment_df = sentiment_df.copy()
+                            sentiment_df['date'] = pd.to_datetime(sentiment_df['date'])
+                            
+                            # Reset index of price data to get date as column
+                            df_reset = df.reset_index()
+                            if 'Date' in df_reset.columns:
+                                df_reset = df_reset.rename(columns={'Date': 'date'})
+                            elif df_reset.index.name == 'Date':
+                                df_reset.index.name = 'date'
+                                df_reset = df_reset.reset_index()
+                            
+                            # Merge on date
+                            df_merged = df_reset.merge(sentiment_df, on='date', how='left')
+                            
+                            # Set date back as index
+                            df_merged = df_merged.set_index('date')
+                            df = df_merged
+                            
+                            # Show sentiment summary
+                            sentiment_count = sentiment_df['headline_count'].sum()
+                            avg_sentiment = sentiment_df['sentiment_avg_compound'].mean()
+                            st.success(f"✅ Fetched {sentiment_count} headlines with avg sentiment: {avg_sentiment:.3f}")
+                        else:
+                            st.info("No news sentiment data found for this ticker and date range.")
+                else:
+                    st.warning("NewsAPI key not found. Set NEWSAPI_KEY in .env file to enable sentiment analysis.")
+            
             # Warn if long windows not available
             if df["sma_200"].isna().sum() > 0:
                 st.info("Some early dates have NaN for MA200. Consider selecting a wider date range to warm-up indicators.")
@@ -258,10 +347,18 @@ def main():
         left, right = st.columns([3, 1])
         with left:
             try:
+                # Debug: Show data info
+                st.write(f"Data shape: {df.shape}")
+                st.write(f"Columns: {list(df.columns)}")
+                st.write(f"Index type: {type(df.index)}")
+                
                 price_fig = plot_price_volume(df)
                 st.plotly_chart(price_fig, use_container_width=True, theme="streamlit")
             except Exception as e:
                 st.warning(f"Unable to render price/volume chart: {e}")
+                st.error(f"Error details: {str(e)}")
+                import traceback
+                st.code(traceback.format_exc())
 
         with right:
             st.markdown("#### Indicators (latest)")
@@ -272,13 +369,10 @@ def main():
             mini_cols[1].metric("Volatility 21d", _fmt(latest_row.get('vol_21', np.nan), ".4f"))
             # Return display as percentage
             ret_display = "—"
-            value = latest_row.get('daily_return', np.nan)
-        if pd.notna(value):
-            ret_val = float(value) * 100.0
-            ret_display = f"{ret_val:.2f}%"
-        else:
-            ret_display = "—"
-
+            value = _to_float(latest_row.get('daily_return', np.nan))
+            if not np.isnan(value):
+                ret_val = value * 100.0
+                ret_display = f"{ret_val:.2f}%"
 
             mini_cols[0].metric("Return 1d", ret_display)
             mini_cols[1].metric("Avg Volume 21d", _fmt(latest_row.get('vol_mean_21', np.nan), ".0f"))

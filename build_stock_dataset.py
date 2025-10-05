@@ -83,6 +83,20 @@ from ta.trend import SMAIndicator, EMAIndicator, MACD
 import requests
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+# Optional modular ingestion
+try:
+    from news_ingestion import fetch_newsapi_headlines, aggregate_daily_sentiment_vader
+except Exception:
+    fetch_newsapi_headlines = None  # type: ignore
+    aggregate_daily_sentiment_vader = None  # type: ignore
+
+# Load .env if available for API keys
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()
+except Exception:
+    pass
+
 
 # -----------------------------
 # Configuration & Logging Setup
@@ -166,8 +180,12 @@ def fetch_ohlcv_yfinance(ticker: str, start_date: str, end_date: str) -> pd.Data
         return pd.DataFrame()
 
     df = data.copy()
-    # Normalize column names
-    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    # Normalize column names - handle MultiIndex columns from yfinance
+    if isinstance(df.columns, pd.MultiIndex):
+        # Flatten MultiIndex columns (e.g., ('Close', 'AAPL') -> 'close')
+        df.columns = [col[0].lower().replace(" ", "_") for col in df.columns]
+    else:
+        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
 
     # Ensure expected columns exist
     expected = {"open", "high", "low", "close", "adj_close", "volume"}
@@ -226,11 +244,13 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     with np.errstate(divide="ignore", invalid="ignore"):
         df["bb_bandwidth_20"] = (df["bb_upper_20"] - df["bb_lower_20"]) / df["bb_middle_20"]
 
-    # RSI (14)
-    df["rsi_14"] = RSIIndicator(close=close, window=14).rsi()
+    # RSI (14) - use smaller window if not enough data
+    rsi_window = min(14, len(df))
+    df["rsi_14"] = RSIIndicator(close=close, window=rsi_window).rsi()
 
-    # ATR (14)
-    df["atr_14"] = AverageTrueRange(high=high, low=low, close=close, window=14).average_true_range()
+    # ATR (14) - use smaller window if not enough data
+    atr_window = min(14, len(df))
+    df["atr_14"] = AverageTrueRange(high=high, low=low, close=close, window=atr_window).average_true_range()
 
     # Daily returns and rolling volatility (21-day)
     df["daily_return"] = close.pct_change()
@@ -268,6 +288,21 @@ def fetch_news_sentiment(
 
     Hooks to extend: Replace/augment this with Alpha Vantage / Finnhub / IEX endpoints as needed.
     """
+    # Prefer modular ingestion if available
+    if fetch_newsapi_headlines is not None and aggregate_daily_sentiment_vader is not None and news_api_key:
+        try:
+            df_news = fetch_newsapi_headlines(query=ticker, start_date=start_date, end_date=end_date, api_key=news_api_key)
+            if df_news is not None and not df_news.empty:
+                daily = aggregate_daily_sentiment_vader(df_news)
+                logger.info("Successfully fetched %d headlines for %s, aggregated to %d days", len(df_news), ticker, len(daily))
+                return daily
+            else:
+                logger.info("No headlines found for %s in date range %s to %s", ticker, start_date, end_date)
+                return pd.DataFrame(columns=["date", "sentiment_avg_compound", "headline_count"])
+        except Exception as exc:
+            logger.warning("Modular news ingestion failed for %s: %s; falling back to inline method.", ticker, exc)
+
+    # Inline simple per-day NewsAPI + VADER fallback
     if not news_api_key:
         logger.info("No NewsAPI key provided, skipping news sentiment for %s", ticker)
         return pd.DataFrame(columns=["date", "sentiment_avg_compound", "headline_count"])  # empty
@@ -279,7 +314,6 @@ def fetch_news_sentiment(
         start_dt = dt.datetime.strptime(start_date, "%Y-%m-%d").date()
         end_dt = dt.datetime.strptime(end_date, "%Y-%m-%d").date()
     except ValueError:
-        # Try alternative formats or fallback
         start_dt = pd.to_datetime(start_date).date()
         end_dt = pd.to_datetime(end_date).date()
 
@@ -287,28 +321,50 @@ def fetch_news_sentiment(
     base_url = "https://newsapi.org/v2/everything"
 
     for day in _date_range(start_dt, end_dt):
-        # Query window: [day, day+1)
         from_iso = dt.datetime.combine(day, dt.time.min).isoformat() + "Z"
         to_iso = dt.datetime.combine(day + dt.timedelta(days=1), dt.time.min).isoformat() + "Z"
+        # Allow overriding sort/search/pageSize from env to match user's curl style
+        sort_by = os.environ.get("NEWSAPI_SORT_BY", "popularity")
+        search_in = os.environ.get("NEWSAPI_SEARCH_IN", "title,description")
+        try:
+            page_size = max(1, min(100, int(os.environ.get("NEWSAPI_PAGE_SIZE", "100"))))
+        except Exception:
+            page_size = 100
 
         params = {
             "q": ticker,
-            "from": from_iso,
-            "to": to_iso,
+            "from": day.strftime("%Y-%m-%d"),
+            "to": (day + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
             "language": "en",
-            "sortBy": "relevancy",
-            "pageSize": 100,
+            "searchIn": search_in,
+            "sortBy": sort_by,
+            "pageSize": page_size,
             "apiKey": news_api_key,
         }
-
         try:
             resp = requests.get(base_url, params=params, timeout=15)
             if resp.status_code != 200:
-                logger.warning("NewsAPI non-200 for %s on %s: %s", ticker, day.isoformat(), resp.status_code)
+                if os.environ.get("NEWSAPI_DEBUG") == "1":
+                    try:
+                        print(f"NewsAPI error status={resp.status_code} body={resp.text[:500]}")
+                    except Exception:
+                        pass
                 continue
             payload = resp.json()
         except Exception as exc:
-            logger.warning("NewsAPI request failed for %s on %s: %s", ticker, day.isoformat(), exc)
+            if os.environ.get("NEWSAPI_DEBUG") == "1":
+                try:
+                    print(f"NewsAPI request exception: {exc}")
+                except Exception:
+                    pass
+            continue
+
+        if isinstance(payload, dict) and payload.get("status") == "error":
+            if os.environ.get("NEWSAPI_DEBUG") == "1":
+                try:
+                    print(f"NewsAPI payload error: code={payload.get('code')} message={payload.get('message')}")
+                except Exception:
+                    pass
             continue
 
         articles = payload.get("articles", []) if isinstance(payload, dict) else []
@@ -320,28 +376,25 @@ def fetch_news_sentiment(
             title = (art or {}).get("title") or ""
             description = (art or {}).get("description") or ""
             text = f"{title}. {description}".strip()
-            if text:
-                try:
-                    score = analyzer.polarity_scores(text).get("compound", 0.0)
-                    compounds.append(float(score))
-                except Exception:
-                    continue
+            if not text:
+                continue
+            try:
+                score = analyzer.polarity_scores(text).get("compound", 0.0)
+                compounds.append(float(score))
+            except Exception:
+                pass
 
         if compounds:
-            avg_compound = float(np.mean(compounds))
-            rows.append(SentimentResult(date=day, avg_compound=avg_compound, headline_count=len(compounds)))
+            rows.append(SentimentResult(date=day, avg_compound=float(np.mean(compounds)), headline_count=len(compounds)))
 
     if not rows:
         return pd.DataFrame(columns=["date", "sentiment_avg_compound", "headline_count"])  # empty
 
-    out = pd.DataFrame(
-        {
-            "date": [r.date for r in rows],
-            "sentiment_avg_compound": [r.avg_compound for r in rows],
-            "headline_count": [r.headline_count for r in rows],
-        }
-    )
-    return out
+    return pd.DataFrame({
+        "date": [r.date for r in rows],
+        "sentiment_avg_compound": [r.avg_compound for r in rows],
+        "headline_count": [r.headline_count for r in rows],
+    })
 
 
 # -----------------------------
@@ -420,7 +473,9 @@ def build_dataset_for_ticker(
         features["date"] = pd.to_datetime(features["date"])  # ensure datetime
 
     # Optional sentiment
-    sentiment_df = fetch_news_sentiment(ticker, start_date, end_date, news_api_key=news_api_key)
+    # Prefer param key; else fallback to env NEWSAPI_KEY
+    key = news_api_key or os.environ.get("NEWSAPI_KEY")
+    sentiment_df = fetch_news_sentiment(ticker, start_date, end_date, news_api_key=key)
     if not sentiment_df.empty:
         sentiment_df = sentiment_df.copy()
         sentiment_df["date"] = pd.to_datetime(sentiment_df["date"])
