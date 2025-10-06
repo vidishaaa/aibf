@@ -26,6 +26,12 @@ import plotly.graph_objects as go
 import streamlit as st
 import os
 
+# Gemini (Google Generative AI)
+try:
+    import google.generativeai as genai  # type: ignore
+except Exception:
+    genai = None  # type: ignore
+
 from stock_logic import (
     fetch_price_data,
     compute_indicators,
@@ -143,6 +149,133 @@ def _to_float(value) -> float:
         return np.nan
 
 
+def _call_gemini_for_recommendation(ticker: str, df: pd.DataFrame) -> tuple[str, int, dict]:
+    """Use Gemini to generate BUY/HOLD/SELL, confidence, and explanation from the latest data.
+
+    Returns (label, confidence, payload_dict). payload_dict contains 'explanation' text for UI.
+    """
+    # Ensure API key
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    if not api_key or genai is None:
+        # Fallback minimal result
+        return ("HOLD", 50, {"explanation": "Gemini not configured. Set GOOGLE_API_KEY to enable AI recommendations."})
+
+    try:
+        genai.configure(api_key=api_key)
+        # Allow overriding the model via env; default to gemini-2.0-flash to match your key usage
+        model_id = os.environ.get("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash")
+        model = genai.GenerativeModel(model_id)
+    except Exception:
+        return ("HOLD", 50, {"explanation": "Failed initializing Gemini. Check GOOGLE_API_KEY."})
+
+    # Prepare compact JSON-like context from latest row and a small history for momentum
+    latest = df.iloc[-1]
+    def safe(v, default=None):
+        try:
+            if isinstance(v, pd.DataFrame):
+                try:
+                    v = v.squeeze("columns")
+                except Exception:
+                    pass
+            if isinstance(v, (pd.Series, np.ndarray, list, tuple)):
+                v = v[-1]
+            if pd.isna(v):
+                return default
+            return float(v)
+        except Exception:
+            return default
+
+    history_len = min(30, len(df))
+    recent = df.tail(history_len)
+
+    # Column helpers to handle case/availability gracefully
+    def pick_series(frame: pd.DataFrame, options: list[str]) -> pd.Series:
+        # try exact matches first
+        for name in options:
+            if name in frame.columns:
+                s = frame[name]
+                if isinstance(s, pd.DataFrame):
+                    # squeeze to one column if possible
+                    if s.shape[1] > 0:
+                        s = s.iloc[:, 0]
+                    else:
+                        continue
+                return pd.to_numeric(s, errors="coerce")
+        # case-insensitive / normalized search
+        lower_map = {str(col).lower(): col for col in frame.columns}
+        for name in options:
+            key = name.lower()
+            if key in lower_map:
+                s = frame[lower_map[key]]
+                if isinstance(s, pd.DataFrame):
+                    if s.shape[1] > 0:
+                        s = s.iloc[:, 0]
+                    else:
+                        continue
+                return pd.to_numeric(s, errors="coerce")
+        return pd.Series(dtype=float)
+
+    close_series = pick_series(recent, ["Close", "close"])  # yfinance typically 'Close'
+    rsi_series = pick_series(recent, ["rsi_14", "RSI", "rsi"]) if "rsi_14" in recent.columns or "RSI" in recent.columns or "rsi" in recent.columns else pd.Series(dtype=float)
+    macd_series = pick_series(recent, ["macd", "MACD"]) if "macd" in recent.columns or "MACD" in recent.columns else pd.Series(dtype=float)
+    sent_series = pick_series(recent, ["sentiment_avg_compound"]) if "sentiment_avg_compound" in recent.columns else pd.Series(dtype=float)
+
+    payload = {
+        "ticker": ticker,
+        "latest": {
+            "close": safe(latest.get("Close")),
+            "sma_50": safe(latest.get("sma_50")),
+            "sma_200": safe(latest.get("sma_200")),
+            "rsi_14": safe(latest.get("rsi_14")),
+            "macd": safe(latest.get("macd")),
+            "macd_signal": safe(latest.get("macd_signal")),
+            "atr_14": safe(latest.get("atr_14")),
+            "vol_mean_21": safe(latest.get("vol_mean_21")),
+            "daily_return": safe(latest.get("daily_return")),
+            "sentiment_avg_compound": safe(latest.get("sentiment_avg_compound")),
+        },
+        "recent_closes": [safe(v) for v in close_series.dropna().tolist()],
+        "recent_rsi": [safe(v) for v in rsi_series.dropna().tolist()],
+        "recent_macd": [safe(v) for v in macd_series.dropna().tolist()],
+        "recent_sentiment": [safe(v) for v in sent_series.dropna().tolist()],
+    }
+
+    system_instructions = (
+        "You are an equity analyst. Analyze the provided technical snapshot and optional sentiment. "
+        "Return a STRICT JSON with keys: label (BUY|HOLD|SELL), confidence (0-100 int), explanation (<=280 chars)."
+    )
+    user_prompt = (
+        "Data:"\
+        f"\n{payload}\n"\
+        "Rules: Consider trend vs MAs, momentum via MACD/RSI, volatility via ATR, volume context, and sentiment. "
+        "Do not include JSON comments."
+    )
+
+    try:
+        resp = model.generate_content([
+            {"role": "system", "parts": [system_instructions]},
+            {"role": "user", "parts": [user_prompt]},
+        ])
+        text = (resp.text or "").strip()
+        # Try to extract JSON
+        import json, re
+        # Find first JSON object in the text
+        match = re.search(r"\{[\s\S]*\}", text)
+        raw = match.group(0) if match else text
+        obj = json.loads(raw)
+        label = str(obj.get("label", "HOLD")).upper()
+        if label not in ("BUY", "HOLD", "SELL"):
+            label = "HOLD"
+        try:
+            conf = int(obj.get("confidence", 50))
+        except Exception:
+            conf = 50
+        explanation = str(obj.get("explanation", "Generated by Gemini.")).strip()
+        return (label, max(0, min(100, conf)), {"explanation": explanation})
+    except Exception as e:
+        return ("HOLD", 50, {"explanation": f"Gemini call failed: {e}"})
+
+
 def plot_price_volume(df: pd.DataFrame) -> go.Figure:
     # Two-row subplot: price on top, volume below (shared x)
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06, row_heights=[0.75, 0.25])
@@ -246,7 +379,7 @@ def main():
     except Exception:
         pass
     st.title("AI Stock Recommendation")
-    st.caption("Rule-based + scoring model over technical indicators. No external LLMs or paid APIs.")
+    st.caption("News Senitment based stock position recommendation using LLMs")
 
     # Sidebar inputs
     st.sidebar.header("Inputs")
@@ -329,7 +462,8 @@ def main():
                 st.info("Some early dates have NaN for MA200. Consider selecting a wider date range to warm-up indicators.")
 
         latest_row = df.iloc[-1]
-        label, confidence, rules = get_recommendation(latest_row)
+        # Use Gemini for recommendation (replaces rule-based logic)
+        label, confidence, ai_payload = _call_gemini_for_recommendation(ticker.strip().upper(), df)
 
         # Top card
         st.subheader("Recommendation")
@@ -377,11 +511,8 @@ def main():
             mini_cols[0].metric("Return 1d", ret_display)
             mini_cols[1].metric("Avg Volume 21d", _fmt(latest_row.get('vol_mean_21', np.nan), ".0f"))
 
-            st.markdown("#### Explainability")
-            for name, info in rules.items():
-                icon = "✅" if info.get("fired") else "➖"
-                contrib = info.get("contribution", 0)
-                st.write(f"{icon} {name} (contrib {contrib:+d}) — {info.get('explanation')}")
+            st.markdown("#### AI Rationale")
+            st.write(ai_payload.get("explanation", "Generated by Gemini"))
 
         st.markdown("### Momentum & Oscillators")
         try:
