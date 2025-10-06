@@ -35,24 +35,21 @@ A comprehensive Streamlit application that analyzes stock data using technical i
 - **Daily Returns**: Price change calculations
 - **Volatility**: 21-day rolling standard deviation
 
-## 🎯 Recommendation System
+## 🤖 AI Recommendation (Gemini)
 
-### Scoring Rules (Hybrid Approach)
-- **Price > MA200**: +2 points (bullish trend)
-- **Price > MA50**: +1 point (short-term bullish)
-- **Golden Cross (MA50 > MA200)**: +3 points (strong bullish signal)
-- **RSI > 70**: -3 points (overbought condition)
-- **RSI < 30**: +2 points (oversold opportunity)
-- **MACD > Signal**: +1 point (momentum confirmation)
-- **Volume Spike**: +1 point (unusual activity)
-- **Positive Daily Return**: +1 point (immediate momentum)
-- **News Sentiment > 0.3**: +1 point (positive news)
-- **News Sentiment < -0.3**: -1 point (negative news)
+This app uses Google's Gemini to produce the final BUY/HOLD/SELL recommendation and confidence. The app compiles a compact snapshot of the latest indicators and optional news sentiment, sends it to Gemini, and displays the AI's label, confidence, and short rationale.
 
-### Confidence Mapping
-- **Score ≥ 3**: BUY (60-95% confidence)
-- **Score -2 to 2**: HOLD (40-70% confidence)
-- **Score < -2**: SELL (60-95% confidence)
+### Configure Gemini
+1. Create a Google AI Studio key and set it in your environment:
+```bash
+export GOOGLE_API_KEY=your_gemini_key   # Windows PowerShell: $env:GOOGLE_API_KEY="your_gemini_key"
+```
+2. Ensure the dependency is installed (included in requirements):
+```bash
+pip install -r requirements.txt
+```
+
+If `GOOGLE_API_KEY` is not set or the API call fails, the app returns a HOLD with a note indicating Gemini is not configured.
 
 ## 🛠️ Installation & Setup
 
