@@ -40,14 +40,32 @@ A comprehensive Streamlit application that analyzes stock data using technical i
 This app uses Google's Gemini to produce the final BUY/HOLD/SELL recommendation and confidence. The app compiles a compact snapshot of the latest indicators and optional news sentiment, sends it to Gemini, and displays the AI's label, confidence, and short rationale.
 
 ### Configure Gemini
-1. Create a Google AI Studio key and set it in your environment:
-```bash
-export GOOGLE_API_KEY=your_gemini_key   # Windows PowerShell: $env:GOOGLE_API_KEY="your_gemini_key"
-```
+1. Create a Google AI Studio key and set it in your environment (choose your shell):
+
+   Bash (macOS/Linux):
+   ```bash
+   export GOOGLE_API_KEY="your_gemini_key"
+   ```
+
+   PowerShell (Windows):
+   ```powershell
+   $env:GOOGLE_API_KEY = "your_gemini_key"
+   ```
+
+   Command Prompt (Windows CMD, session only):
+   ```bat
+   set GOOGLE_API_KEY=your_gemini_key
+   ```
+
+   To persist on Windows (optional):
+   ```bat
+   setx GOOGLE_API_KEY your_gemini_key
+   ```
+
 2. Ensure the dependency is installed (included in requirements):
-```bash
-pip install -r requirements.txt
-```
+   ```bash
+   pip install -r requirements.txt
+   ```
 
 If `GOOGLE_API_KEY` is not set or the API call fails, the app returns a HOLD with a note indicating Gemini is not configured.
 
@@ -58,20 +76,56 @@ If `GOOGLE_API_KEY` is not set or the API call fails, the app returns a HOLD wit
 - pip package manager
 
 ### Quick Start
+
+Bash (macOS/Linux):
 ```bash
 # Clone the repository
 git clone <repository-url>
 cd aibf
 
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# Create and activate virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Run the application
-streamlit run app.py
+# Run the application (module form avoids launcher issues)
+python -m streamlit run app.py
+```
+
+PowerShell (Windows):
+```powershell
+# Clone the repository
+git clone <repository-url>
+cd aibf
+
+# Create and activate virtual environment (use a specific Python if needed)
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the application (module form avoids broken launcher paths)
+python -m streamlit run app.py
+```
+
+Command Prompt (Windows CMD):
+```bat
+REM Clone the repository
+git clone <repository-url>
+cd aibf
+
+REM Create and activate virtual environment
+py -3.12 -m venv .venv
+call .\.venv\Scripts\activate.bat
+
+REM Install dependencies
+pip install -r requirements.txt
+
+REM Run the application
+python -m streamlit run app.py
 ```
 
 ### Optional: News Sentiment Setup
@@ -86,8 +140,9 @@ NEWSAPI_KEY=your_api_key_here
 ## 📱 How to Use
 
 ### 1. Launch the App
+Use the module form for all shells:
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 The app will open in your browser at `http://localhost:8501`
 
@@ -191,6 +246,12 @@ RSI: 65.2 | MACD: 0.45
 2. **News API Errors**: Verify API key and rate limits
 3. **Import Errors**: Ensure all dependencies are installed
 4. **Date Range Issues**: Use wider date ranges for long-term indicators
+5. **Windows: "Fatal error in launcher" when running `streamlit run`**:
+   - Cause: A broken global Streamlit launcher pointing to a removed Python (e.g., 3.11).
+   - Fix:
+     - Create a fresh venv with a working Python: `py -3.12 -m venv .venv`
+     - Activate it and reinstall deps: `pip install -r requirements.txt`
+     - Always launch via the module form: `python -m streamlit run app.py`
 
 ### Debug Mode
 The app includes debugging information to help identify data issues.
